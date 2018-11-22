@@ -65,7 +65,7 @@ const addKey = ({video, contentId, initData, cert, options, getLicense, eventBus
     keySession.contentId = contentId;
 
     keySession.addEventListener('webkitkeymessage', (event) => {
-      getLicense(options, contentId, event.message, (err, license) => {
+      getLicense(options, contentId, event.message, keySession, (err, license) => {
         if (eventBus) {
           eventBus.trigger('licenserequestattempted');
         }
@@ -110,7 +110,7 @@ const defaultGetContentId = (emeOptions, initData) => {
 };
 
 const defaultGetLicense = (licenseUri) => {
-  return (emeOptions, contentId, keyMessage, callback) => {
+  return (emeOptions, contentId, keyMessage, keySession, callback) => {
     videojs.xhr({
       uri: licenseUri,
       method: 'POST',
