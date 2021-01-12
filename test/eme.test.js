@@ -9,6 +9,7 @@ import {
   addPendingSessions,
   getSupportedConfigurations
 } from '../src/eme';
+import { getMockEventBus } from './utils';
 import sinon from 'sinon';
 
 // mock session to make testing easier (so we can trigger events)
@@ -52,6 +53,10 @@ QUnit.test('keystatuseschange triggers keystatuschange on eventBus for each key'
   const mockSession = getMockSession();
   const eventBus = {
     trigger: (event) => {
+      if (typeof event === 'string') {
+        return;
+      }
+
       if (!callCount[event.keyId][event.status]) {
         callCount[event.keyId][event.status] = 0;
       }
@@ -139,7 +144,7 @@ QUnit.test('keystatuseschange triggers keystatuschange on eventBus for each key'
 
 });
 
-QUnit.test('keystatuseschange with expired key closes session', function(assert) {
+QUnit.test('keystatuseschange with expired key closes and recreates session', function(assert) {
   const removeSessionCalls = [];
   // once the eme module gets the removeSession function, the session argument is already
   // bound to the function (note that it's a custom session maintained by the plugin, not
@@ -150,10 +155,15 @@ QUnit.test('keystatuseschange with expired key closes session', function(assert)
   const eventBus = {
     trigger: (name) => {}
   };
+  let creates = 0;
 
   makeNewRequest({
     mediaKeys: {
-      createSession: () => mockSession
+      createSession: () => {
+        creates++;
+
+        return mockSession;
+      }
     },
     initDataType: '',
     initData,
@@ -163,6 +173,7 @@ QUnit.test('keystatuseschange with expired key closes session', function(assert)
     eventBus
   });
 
+  assert.equal(creates, 1, 'created session');
   assert.equal(mockSession.listeners.length, 2, 'added listeners');
   assert.equal(mockSession.listeners[1].type,
     'keystatuseschange',
@@ -190,6 +201,8 @@ QUnit.test('keystatuseschange with expired key closes session', function(assert)
   // synchronously
   assert.equal(removeSessionCalls.length, 1, 'called remove session');
   assert.equal(removeSessionCalls[0], initData, 'called to remove session with initData');
+
+  assert.equal(creates, 2, 'created another session');
 });
 
 QUnit.test('keystatuseschange with internal-error logs a warning', function(assert) {
@@ -271,13 +284,15 @@ QUnit.test('accepts a license URL as an option', function(assert) {
       keySystems: {
         'com.widevine.alpha': 'some-url'
       }
-    }
+    },
+    eventBus: getMockEventBus()
   }).catch((e) => {});
 
   setTimeout(() => {
     session.trigger({
       type: 'message',
-      message: 'the-message'
+      message: 'the-message',
+      messageType: 'license-request'
     });
 
     assert.equal(xhrCalls.length, 1, 'made one XHR');
@@ -328,13 +343,15 @@ QUnit.test('accepts a license URL as property', function(assert) {
           url: 'some-url'
         }
       }
-    }
+    },
+    eventBus: getMockEventBus()
   }).catch((e) => {});
 
   setTimeout(() => {
     session.trigger({
       type: 'message',
-      message: 'the-message'
+      message: 'the-message',
+      messageType: 'license-request'
     });
 
     assert.equal(xhrCalls.length, 1, 'made one XHR');
@@ -466,7 +483,7 @@ QUnit.test('5 July 2016 lifecycle', function(assert) {
     assert.equal(callCounts.licenseRequestAttempts, 0,
       'license request event not triggered (since no callback yet)');
 
-    keySessionEventListeners.message({});
+    keySessionEventListeners.message({messageType: 'license-request'});
 
     // Step 3: get license
     assert.equal(callCounts.getCertificate, 1, 'certificate requested');
@@ -524,7 +541,8 @@ QUnit.test('errors when neither url nor getLicense is given', function(assert) {
   standard5July2016({
     video: {},
     keySystemAccess,
-    options
+    options,
+    eventBus: getMockEventBus()
   }).catch((err) => {
     assert.equal(
       err,
@@ -555,7 +573,8 @@ QUnit.test('rejects promise when getCertificate throws error', function(assert) 
   standard5July2016({
     video: {},
     keySystemAccess,
-    options
+    options,
+    eventBus: getMockEventBus()
   }).catch((err) => {
     assert.equal(err, 'error fetching certificate', 'correct error message');
     done();
@@ -579,7 +598,8 @@ QUnit.test('rejects promise when createMediaKeys rejects', function(assert) {
   standard5July2016({
     video: {},
     keySystemAccess,
-    options
+    options,
+    eventBus: getMockEventBus()
   }).catch((err) => {
     assert.equal(err, 'Failed to create and initialize a MediaKeys object',
       'uses generic message');
@@ -605,7 +625,8 @@ QUnit.test('rejects promise when createMediaKeys rejects', function(assert) {
   standard5July2016({
     video: {},
     keySystemAccess,
-    options
+    options,
+    eventBus: getMockEventBus()
   }).catch((err) => {
     assert.equal(err, 'failed creating mediaKeys', 'uses specific error when given');
     done();
@@ -653,7 +674,8 @@ QUnit.test('rejects promise when addPendingSessions rejects', function(assert) {
     standard5July2016({
       video,
       keySystemAccess,
-      options
+      options,
+      eventBus: getMockEventBus()
     }).catch((err) => {
       assert.equal(err, errMessage, testDescription);
       done();
@@ -676,6 +698,54 @@ QUnit.test('rejects promise when addPendingSessions rejects', function(assert) {
 
 });
 
+QUnit.test('getLicense not called for messageType that isnt license-request or license-renewal', function(assert) {
+  const done = assert.async();
+  let getLicenseCalls = 0;
+  const options = {
+    keySystems: {
+      'com.widevine.alpha': {
+        url: 'some-url',
+        getLicense(emeOptions, keyMessage, callback) {
+          getLicenseCalls++;
+        }
+      }
+    }
+  };
+  const keySystemAccess = {
+    keySystem: 'com.widevine.alpha',
+    createMediaKeys: () => {
+      return Promise.resolve({
+        setServerCertificate: () => Promise.resolve(),
+        createSession: () => {
+          return {
+            addEventListener: (event, callback) => {
+              if (event === 'message') {
+                setTimeout(() => {
+                  callback({message: 'whatever', messageType: 'do-not-request-license'});
+                  assert.equal(getLicenseCalls, 0, 'did not call getLicense');
+                  done();
+                });
+              }
+            },
+            keyStatuses: [],
+            generateRequest: () => Promise.resolve()
+          };
+        }
+      });
+    }
+  };
+  const video = {
+    setMediaKeys: () => Promise.resolve()
+  };
+
+  standard5July2016({
+    video,
+    keySystemAccess,
+    options,
+    eventBus: getMockEventBus()
+  });
+});
+
 QUnit.test('getLicense promise rejection', function(assert) {
   const options = {
     keySystems: {
@@ -696,7 +766,7 @@ QUnit.test('getLicense promise rejection', function(assert) {
           return {
             addEventListener: (event, callback) => {
               setTimeout(() => {
-                callback(options, {message: 'whatever'});
+                callback({message: 'whatever', messageType: 'license-request'});
               });
             },
             keyStatuses: [],
@@ -714,7 +784,8 @@ QUnit.test('getLicense promise rejection', function(assert) {
   standard5July2016({
     video,
     keySystemAccess,
-    options
+    options,
+    eventBus: getMockEventBus()
   }).catch((err) => {
     assert.equal(err, 'error getting license', 'correct error message');
     done();
@@ -794,7 +865,7 @@ QUnit.test('keySession.update promise rejection', function(assert) {
           return {
             addEventListener: (event, callback) => {
               setTimeout(() => {
-                callback({message: 'whatever'});
+                callback({messageType: 'license-request', message: 'whatever'});
               });
             },
             keyStatuses: [],
@@ -813,7 +884,8 @@ QUnit.test('keySession.update promise rejection', function(assert) {
   standard5July2016({
     video,
     keySystemAccess,
-    options
+    options,
+    eventBus: getMockEventBus()
   }).catch((err) => {
     assert.equal(err, 'keySession update failed', 'correct error message');
     done();
@@ -854,13 +926,15 @@ QUnit.test('emeHeaders option sets headers on default license xhr request', func
       emeHeaders: {
         'Some-Header': 'some-header-value'
       }
-    }
+    },
+    eventBus: getMockEventBus()
   }).catch((e) => {});
 
   setTimeout(() => {
     session.trigger({
       type: 'message',
-      message: 'the-message'
+      message: 'the-message',
+      messageType: 'license-request'
     });
 
     assert.equal(xhrCalls.length, 1, 'made one XHR');
@@ -919,13 +993,15 @@ QUnit.test('licenseHeaders keySystems property overrides emeHeaders value', func
       emeHeaders: {
         'Some-Header': 'lower-priority-header-value'
       }
-    }
+    },
+    eventBus: getMockEventBus()
   }).catch((e) => {});
 
   setTimeout(() => {
     session.trigger({
       type: 'message',
-      message: 'the-message'
+      message: 'the-message',
+      messageType: 'license-request'
     });
 
     assert.equal(xhrCalls.length, 1, 'made one XHR');
@@ -1028,7 +1104,7 @@ QUnit.test('addPendingSessions reuses saved options', function(assert) {
             'added listener for message event'
           );
           // callback should call getLicense, which continues this test
-          eventListeners[0].callback({ message: 'test message' });
+          eventListeners[0].callback({messageType: 'license-request', message: 'test message'});
           return Promise.resolve();
         },
         // this call and everything after is beyond the scope of this test
@@ -1150,4 +1226,23 @@ QUnit.test('uses supportedConfigurations directly if provided', function(assert)
     }],
     'used supportedConfigurations directly'
   );
+});
+
+QUnit.test('makeNewRequest triggers keysessioncreated', function(assert) {
+  const done = assert.async();
+  const mockSession = getMockSession();
+
+  makeNewRequest({
+    mediaKeys: {
+      createSession: () => mockSession
+    },
+    eventBus: {
+      trigger: (eventName) => {
+        if (eventName === 'keysessioncreated') {
+          assert.ok(true, 'got a keysessioncreated event');
+          done();
+        }
+      }
+    }
+  });
 });

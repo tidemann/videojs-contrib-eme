@@ -73,20 +73,27 @@ export const getSupportedKeySystem = (keySystems) => {
   return promise;
 };
 
-export const makeNewRequest = ({
-  mediaKeys,
-  initDataType,
-  initData,
-  options,
-  getLicense,
-  removeSession,
-  eventBus
-}) => {
+export const makeNewRequest = (requestOptions) => {
+  const {
+    mediaKeys,
+    initDataType,
+    initData,
+    options,
+    getLicense,
+    removeSession,
+    eventBus
+  } = requestOptions;
   const keySession = mediaKeys.createSession();
+
+  eventBus.trigger('keysessioncreated');
 
   return new Promise((resolve, reject) => {
 
     keySession.addEventListener('message', (event) => {
+      // all other types will be handled by keystatuseschange
+      if (event.messageType !== 'license-request' && event.messageType !== 'license-renewal') {
+        return;
+      }
       getLicense(options, event.message)
         .then((license) => {
           resolve(keySession.update(license));
@@ -136,6 +143,7 @@ export const makeNewRequest = ({
         // videojs.log.debug('Session expired, closing the session.');
         keySession.close().then(() => {
           removeSession(initData);
+          makeNewRequest(requestOptions);
         });
       }
     }, false);
