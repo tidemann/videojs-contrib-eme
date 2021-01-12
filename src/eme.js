@@ -1,6 +1,56 @@
 import videojs from 'video.js';
 import { requestPlayreadyLicense } from './playready';
 import window from 'global/window';
+import {mergeAndRemoveNull} from './utils';
+
+/**
+ * Returns an array of MediaKeySystemConfigurationObjects provided in the keySystem
+ * options.
+ *
+ * @see {@link https://www.w3.org/TR/encrypted-media/#dom-mediakeysystemconfiguration|MediaKeySystemConfigurationObject}
+ *
+ * @param {Object} keySystemOptions
+ *        Options passed into videojs-contrib-eme for a specific keySystem
+ * @return {Object[]}
+ *         Array of MediaKeySystemConfigurationObjects
+ */
+export const getSupportedConfigurations = (keySystemOptions) => {
+  if (keySystemOptions.supportedConfigurations) {
+    return keySystemOptions.supportedConfigurations;
+  }
+
+  // TODO use initDataTypes when appropriate
+  const supportedConfiguration = {};
+  const audioContentType = keySystemOptions.audioContentType;
+  const audioRobustness = keySystemOptions.audioRobustness;
+  const videoContentType = keySystemOptions.videoContentType;
+  const videoRobustness = keySystemOptions.videoRobustness;
+  const persistentState = keySystemOptions.persistentState;
+
+  if (audioContentType || audioRobustness) {
+    supportedConfiguration.audioCapabilities = [
+      Object.assign({},
+        (audioContentType ? { contentType: audioContentType } : {}),
+        (audioRobustness ? { robustness: audioRobustness } : {})
+      )
+    ];
+  }
+
+  if (videoContentType || videoRobustness) {
+    supportedConfiguration.videoCapabilities = [
+      Object.assign({},
+        (videoContentType ? { contentType: videoContentType } : {}),
+        (videoRobustness ? { robustness: videoRobustness } : {})
+      )
+    ];
+  }
+
+  if (persistentState) {
+    supportedConfiguration.persistentState = persistentState;
+  }
+
+  return [supportedConfiguration];
+};
 
 export const getSupportedKeySystem = (keySystems) => {
   // As this happens after the src is set on the video, we rely only on the set src (we
@@ -9,27 +59,14 @@ export const getSupportedKeySystem = (keySystems) => {
   let promise;
 
   Object.keys(keySystems).forEach((keySystem) => {
-    // TODO use initDataTypes when appropriate
-    const systemOptions = {};
-    const audioContentType = keySystems[keySystem].audioContentType;
-    const videoContentType = keySystems[keySystem].videoContentType;
-
-    if (audioContentType) {
-      systemOptions.audioCapabilities = [{
-        contentType: audioContentType
-      }];
-    }
-    if (videoContentType) {
-      systemOptions.videoCapabilities = [{
-        contentType: videoContentType
-      }];
-    }
+    const supportedConfigurations = getSupportedConfigurations(keySystems[keySystem]);
 
     if (!promise) {
-      promise = window.navigator.requestMediaKeySystemAccess(keySystem, [systemOptions]);
+      promise =
+        window.navigator.requestMediaKeySystemAccess(keySystem, supportedConfigurations);
     } else {
-      promise = promise.catch(
-        (e) => window.navigator.requestMediaKeySystemAccess(keySystem, [systemOptions]));
+      promise = promise.catch((e) =>
+        window.navigator.requestMediaKeySystemAccess(keySystem, supportedConfigurations));
     }
   });
 
@@ -47,65 +84,96 @@ export const makeNewRequest = ({
 }) => {
   const keySession = mediaKeys.createSession();
 
-  keySession.addEventListener('message', (event) => {
-    getLicense(options, event.message)
-      .then((license) => {
-        return keySession.update(license);
-      })
-      .catch(videojs.log.error.bind(videojs.log.error, 'failed to get and set license'));
-  }, false);
+  return new Promise((resolve, reject) => {
 
-  keySession.addEventListener('keystatuseschange', (event) => {
-    let expired = false;
+    keySession.addEventListener('message', (event) => {
+      getLicense(options, event.message)
+        .then((license) => {
+          resolve(keySession.update(license));
+        })
+        .catch((err) => {
+          reject(err);
+        });
+    }, false);
 
-    // based on https://www.w3.org/TR/encrypted-media/#example-using-all-events
-    keySession.keyStatuses.forEach((status, keyId) => {
-      // Trigger an event so that outside listeners can take action if appropriate.
-      // For instance, the `output-restricted` status should result in an
-      // error being thrown.
-      eventBus.trigger({
-        keyId,
-        status,
-        target: keySession,
-        type: 'keystatuschange'
+    keySession.addEventListener('keystatuseschange', (event) => {
+      let expired = false;
+
+      // based on https://www.w3.org/TR/encrypted-media/#example-using-all-events
+      keySession.keyStatuses.forEach((status, keyId) => {
+        // Trigger an event so that outside listeners can take action if appropriate.
+        // For instance, the `output-restricted` status should result in an
+        // error being thrown.
+        eventBus.trigger({
+          keyId,
+          status,
+          target: keySession,
+          type: 'keystatuschange'
+        });
+        switch (status) {
+        case 'expired':
+          // If one key is expired in a session, all keys are expired. From
+          // https://www.w3.org/TR/encrypted-media/#dom-mediakeystatus-expired, "All other
+          // keys in the session must have this status."
+          expired = true;
+          break;
+        case 'internal-error':
+          // "This value is not actionable by the application."
+          // https://www.w3.org/TR/encrypted-media/#dom-mediakeystatus-internal-error
+          videojs.log.warn(
+            'Key status reported as "internal-error." Leaving the session open since we ' +
+            'don\'t have enough details to know if this error is fatal.', event);
+          break;
+        }
       });
-      switch (status) {
-      case 'expired':
-        // If one key is expired in a session, all keys are expired. From
-        // https://www.w3.org/TR/encrypted-media/#dom-mediakeystatus-expired, "All other
-        // keys in the session must have this status."
-        expired = true;
-        break;
-      case 'internal-error':
-        // "This value is not actionable by the application."
-        // https://www.w3.org/TR/encrypted-media/#dom-mediakeystatus-internal-error
-        videojs.log.warn(
-          'Key status reported as "internal-error." Leaving the session open since we ' +
-          'don\'t have enough details to know if this error is fatal.', event);
-        break;
+
+      if (expired) {
+        // Close session and remove it from the session list to ensure that a new
+        // session can be created.
+        //
+        // TODO convert to videojs.log.debug and add back in
+        // https://github.com/videojs/video.js/pull/4780
+        // videojs.log.debug('Session expired, closing the session.');
+        keySession.close().then(() => {
+          removeSession(initData);
+        });
       }
+    }, false);
+
+    keySession.generateRequest(initDataType, initData).catch(() => {
+      reject('Unable to create or initialize key session');
     });
-
-    if (expired) {
-      // Close session and remove it from the session list to ensure that a new
-      // session can be created.
-      //
-      // TODO convert to videojs.log.debug and add back in
-      // https://github.com/videojs/video.js/pull/4780
-      // videojs.log.debug('Session expired, closing the session.');
-      keySession.close().then(() => {
-        removeSession(initData);
-      });
-    }
-  }, false);
-
-  keySession.generateRequest(initDataType, initData).catch(
-    videojs.log.error.bind(videojs.log.error,
-      'Unable to create or initialize key session')
-  );
+  });
 };
 
-const addSession = ({
+/*
+ * Creates a new media key session if media keys are available, otherwise queues the
+ * session creation for when the media keys are available.
+ *
+ * @see {@link https://www.w3.org/TR/encrypted-media/#dom-mediakeysession|MediaKeySession}
+ * @see {@link https://www.w3.org/TR/encrypted-media/#dom-mediakeys|MediaKeys}
+ *
+ * @function addSession
+ * @param {Object} video
+ *        Target video element
+ * @param {string} initDataType
+ *        The type of init data provided
+ * @param {Uint8Array} initData
+ *        The media's init data
+ * @param {Object} options
+ *        Options provided to the plugin for this key system
+ * @param {function()} [getLicense]
+ *        User provided function to retrieve a license
+ * @param {function()} removeSession
+ *        Function to remove the persisted session on key expiration so that a new session
+ *        may be created
+ * @param {Object} eventBus
+ *        Event bus for any events pertinent to users
+ * @return {Promise}
+ *         A resolved promise if session is waiting for media keys, or a promise for the
+ *         session creation if media keys are available
+ */
+export const addSession = ({
   video,
   initDataType,
   initData,
@@ -115,7 +183,7 @@ const addSession = ({
   eventBus
 }) => {
   if (video.mediaKeysObject) {
-    makeNewRequest({
+    return makeNewRequest({
       mediaKeys: video.mediaKeysObject,
       initDataType,
       initData,
@@ -124,68 +192,99 @@ const addSession = ({
       removeSession,
       eventBus
     });
-  } else {
-    video.pendingSessionData.push({initDataType, initData});
   }
+
+  video.pendingSessionData.push({
+    initDataType,
+    initData,
+    options,
+    getLicense,
+    removeSession,
+    eventBus
+  });
+  return Promise.resolve();
 };
 
-const setMediaKeys = ({
+/*
+ * Given media keys created from a key system access object, check for any session data
+ * that was queued and create new sessions for each.
+ *
+ * @see {@link https://www.w3.org/TR/encrypted-media/#dom-mediakeysystemaccess|MediaKeySystemAccess}
+ * @see {@link https://www.w3.org/TR/encrypted-media/#dom-mediakeysession|MediaKeySession}
+ * @see {@link https://www.w3.org/TR/encrypted-media/#dom-mediakeys|MediaKeys}
+ *
+ * @function addPendingSessions
+ * @param {Object} video
+ *        Target video element
+ * @param {string} [certificate]
+ *        The server certificate (if used)
+ * @param {Object} createdMediaKeys
+ *        Media keys to use for session creation
+ * @return {Promise}
+ *         A promise containing new session creations and setting of media keys on the
+ *         video object
+ */
+export const addPendingSessions = ({
   video,
   certificate,
-  createdMediaKeys,
-  options,
-  getLicense,
-  removeSession,
-  eventBus
+  createdMediaKeys
 }) => {
+  // save media keys on the video element to act as a reference for other functions so
+  // that they don't recreate the keys
   video.mediaKeysObject = createdMediaKeys;
+  const promises = [];
 
   if (certificate) {
-    createdMediaKeys.setServerCertificate(certificate);
+    promises.push(createdMediaKeys.setServerCertificate(certificate));
   }
 
   for (let i = 0; i < video.pendingSessionData.length; i++) {
     const data = video.pendingSessionData[i];
 
-    makeNewRequest({
+    promises.push(makeNewRequest({
       mediaKeys: video.mediaKeysObject,
       initDataType: data.initDataType,
       initData: data.initData,
-      options,
-      getLicense,
-      removeSession,
-      eventBus
-    });
+      options: data.options,
+      getLicense: data.getLicense,
+      removeSession: data.removeSession,
+      eventBus: data.eventBus
+    }));
   }
 
   video.pendingSessionData = [];
 
-  return video.setMediaKeys(createdMediaKeys);
+  promises.push(video.setMediaKeys(createdMediaKeys));
+
+  return Promise.all(promises);
 };
 
-const defaultPlayreadyGetLicense = (url) => (emeOptions, keyMessage, callback) => {
-  requestPlayreadyLicense(url, keyMessage, (err, response, responseBody) => {
+const defaultPlayreadyGetLicense = (keySystemOptions) => (emeOptions, keyMessage, callback) => {
+  requestPlayreadyLicense(keySystemOptions, keyMessage, emeOptions, callback);
+};
+
+export const defaultGetLicense = (keySystemOptions) => (emeOptions, keyMessage, callback) => {
+  const headers = mergeAndRemoveNull(
+    {'Content-type': 'application/octet-stream'},
+    emeOptions.emeHeaders,
+    keySystemOptions.licenseHeaders
+  );
+
+  videojs.xhr({
+    uri: keySystemOptions.url,
+    method: 'POST',
+    responseType: 'arraybuffer',
+    body: keyMessage,
+    headers
+  }, (err, response, responseBody) => {
     if (err) {
       callback(err);
       return;
     }
 
-    callback(null, responseBody);
-  });
-};
-
-const defaultGetLicense = (url) => (emeOptions, keyMessage, callback) => {
-  videojs.xhr({
-    uri: url,
-    method: 'POST',
-    responseType: 'arraybuffer',
-    body: keyMessage,
-    headers: {
-      'Content-type': 'application/octet-stream'
-    }
-  }, (err, response, responseBody) => {
-    if (err) {
-      callback(err);
+    if (response.statusCode >= 400 && response.statusCode <= 599) {
+      // Pass an empty object as the error to use the default code 5 error message
+      callback({});
       return;
     }
 
@@ -202,6 +301,7 @@ const promisifyGetLicense = (getLicenseFn, eventBus) => {
         }
         if (err) {
           reject(err);
+          return;
         }
 
         resolve(license);
@@ -221,8 +321,8 @@ const standardizeKeySystemOptions = (keySystem, keySystemOptions) => {
 
   if (keySystemOptions.url && !keySystemOptions.getLicense) {
     keySystemOptions.getLicense = keySystem === 'com.microsoft.playready' ?
-      defaultPlayreadyGetLicense(keySystemOptions.url) :
-      defaultGetLicense(keySystemOptions.url);
+      defaultPlayreadyGetLicense(keySystemOptions) :
+      defaultGetLicense(keySystemOptions);
   }
 
   return keySystemOptions;
@@ -232,6 +332,7 @@ export const standard5July2016 = ({
   video,
   initDataType,
   initData,
+  keySystemAccess,
   options,
   removeSession,
   eventBus
@@ -248,58 +349,49 @@ export const standard5July2016 = ({
     let certificate;
     let keySystemOptions;
 
-    keySystemPromise = getSupportedKeySystem(options.keySystems);
+    keySystemPromise = new Promise((resolve, reject) => {
+      // save key system for adding sessions
+      video.keySystem = keySystemAccess.keySystem;
 
-    if (!keySystemPromise) {
-      videojs.log.error('No supported key system found');
-      return Promise.resolve();
-    }
+      keySystemOptions = standardizeKeySystemOptions(
+        keySystemAccess.keySystem,
+        options.keySystems[keySystemAccess.keySystem]);
 
-    keySystemPromise = keySystemPromise.then((keySystemAccess) => {
-      return new Promise((resolve, reject) => {
-        // save key system for adding sessions
-        video.keySystem = keySystemAccess.keySystem;
+      if (!keySystemOptions.getCertificate) {
+        resolve(keySystemAccess);
+        return;
+      }
 
-        keySystemOptions = standardizeKeySystemOptions(
-          keySystemAccess.keySystem,
-          options.keySystems[keySystemAccess.keySystem]);
-
-        if (!keySystemOptions.getCertificate) {
-          resolve(keySystemAccess);
+      keySystemOptions.getCertificate(options, (err, cert) => {
+        if (err) {
+          reject(err);
           return;
         }
 
-        keySystemOptions.getCertificate(options, (err, cert) => {
-          if (err) {
-            reject(err);
-            return;
-          }
+        certificate = cert;
 
-          certificate = cert;
-
-          resolve(keySystemAccess);
-        });
+        resolve();
       });
-    }).then((keySystemAccess) => {
+    }).then(() => {
       return keySystemAccess.createMediaKeys();
     }).then((createdMediaKeys) => {
-      return setMediaKeys({
+      return addPendingSessions({
         video,
         certificate,
-        createdMediaKeys,
-        options,
-        getLicense: promisifyGetLicense(keySystemOptions.getLicense, eventBus),
-        removeSession,
-        eventBus
+        createdMediaKeys
       });
-    }).catch(
-      videojs.log.error.bind(videojs.log.error,
-        'Failed to create and initialize a MediaKeys object')
-    );
+    }).catch((err) => {
+      // if we have a specific error message, use it, otherwise show a more
+      // generic one
+      if (err) {
+        return Promise.reject(err);
+      }
+      return Promise.reject('Failed to create and initialize a MediaKeys object');
+    });
   }
 
   return keySystemPromise.then(() => {
-    addSession({
+    return addSession({
       video,
       initDataType,
       initData,
