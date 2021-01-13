@@ -1,4 +1,4 @@
-/*! @name videojs-contrib-eme @version 3.7.0 @license Apache-2.0 */
+/*! @name videojs-contrib-eme @version 3.8.0 @license Apache-2.0 */
 'use strict';
 
 Object.defineProperty(exports, '__esModule', { value: true });
@@ -210,17 +210,23 @@ var getSupportedKeySystem = function getSupportedKeySystem(keySystems) {
   });
   return promise;
 };
-var makeNewRequest = function makeNewRequest(_ref) {
-  var mediaKeys = _ref.mediaKeys,
-      initDataType = _ref.initDataType,
-      initData = _ref.initData,
-      options = _ref.options,
-      getLicense = _ref.getLicense,
-      removeSession = _ref.removeSession,
-      eventBus = _ref.eventBus;
+var makeNewRequest = function makeNewRequest(requestOptions) {
+  var mediaKeys = requestOptions.mediaKeys,
+      initDataType = requestOptions.initDataType,
+      initData = requestOptions.initData,
+      options = requestOptions.options,
+      getLicense = requestOptions.getLicense,
+      removeSession = requestOptions.removeSession,
+      eventBus = requestOptions.eventBus;
   var keySession = mediaKeys.createSession();
+  eventBus.trigger('keysessioncreated');
   return new Promise(function (resolve, reject) {
     keySession.addEventListener('message', function (event) {
+      // all other types will be handled by keystatuseschange
+      if (event.messageType !== 'license-request' && event.messageType !== 'license-renewal') {
+        return;
+      }
+
       getLicense(options, event.message).then(function (license) {
         resolve(keySession.update(license));
       }).catch(function (err) {
@@ -266,6 +272,7 @@ var makeNewRequest = function makeNewRequest(_ref) {
         // videojs.log.debug('Session expired, closing the session.');
         keySession.close().then(function () {
           removeSession(initData);
+          makeNewRequest(requestOptions);
         });
       }
     }, false);
@@ -302,14 +309,14 @@ var makeNewRequest = function makeNewRequest(_ref) {
  *         session creation if media keys are available
  */
 
-var addSession = function addSession(_ref2) {
-  var video = _ref2.video,
-      initDataType = _ref2.initDataType,
-      initData = _ref2.initData,
-      options = _ref2.options,
-      getLicense = _ref2.getLicense,
-      removeSession = _ref2.removeSession,
-      eventBus = _ref2.eventBus;
+var addSession = function addSession(_ref) {
+  var video = _ref.video,
+      initDataType = _ref.initDataType,
+      initData = _ref.initData,
+      options = _ref.options,
+      getLicense = _ref.getLicense,
+      removeSession = _ref.removeSession,
+      eventBus = _ref.eventBus;
 
   if (video.mediaKeysObject) {
     return makeNewRequest({
@@ -353,10 +360,10 @@ var addSession = function addSession(_ref2) {
  *         video object
  */
 
-var addPendingSessions = function addPendingSessions(_ref3) {
-  var video = _ref3.video,
-      certificate = _ref3.certificate,
-      createdMediaKeys = _ref3.createdMediaKeys;
+var addPendingSessions = function addPendingSessions(_ref2) {
+  var video = _ref2.video,
+      certificate = _ref2.certificate,
+      createdMediaKeys = _ref2.createdMediaKeys;
   // save media keys on the video element to act as a reference for other functions so
   // that they don't recreate the keys
   video.mediaKeysObject = createdMediaKeys;
@@ -455,14 +462,14 @@ var standardizeKeySystemOptions = function standardizeKeySystemOptions(keySystem
   return keySystemOptions;
 };
 
-var standard5July2016 = function standard5July2016(_ref4) {
-  var video = _ref4.video,
-      initDataType = _ref4.initDataType,
-      initData = _ref4.initData,
-      keySystemAccess = _ref4.keySystemAccess,
-      options = _ref4.options,
-      removeSession = _ref4.removeSession,
-      eventBus = _ref4.eventBus;
+var standard5July2016 = function standard5July2016(_ref3) {
+  var video = _ref3.video,
+      initDataType = _ref3.initDataType,
+      initData = _ref3.initData,
+      keySystemAccess = _ref3.keySystemAccess,
+      options = _ref3.options,
+      removeSession = _ref3.removeSession,
+      eventBus = _ref3.eventBus;
   var keySystemPromise = Promise.resolve();
 
   if (typeof video.mediaKeysObject === 'undefined') {
@@ -596,6 +603,7 @@ var addKey = function addKey(_ref2) {
       return;
     }
 
+    eventBus.trigger('keysessioncreated');
     keySession.contentId = contentId;
     keySession.addEventListener('webkitkeymessage', function (event) {
       getLicense(options, contentId, event.message, keySession, function (err, license) {
@@ -771,7 +779,9 @@ var createSession = function createSession(video, initData, options, eventBus) {
 
   if (!session) {
     throw new Error('Could not create key session.');
-  } // Note that mskeymessage may not always be called for PlayReady:
+  }
+
+  eventBus.trigger('keysessioncreated'); // Note that mskeymessage may not always be called for PlayReady:
   //
   // "If initData contains a PlayReady object that contains an OnDemand header, only a
   // keyAdded event is returned (as opposed to a keyMessage event as described in the
@@ -780,7 +790,6 @@ var createSession = function createSession(video, initData, options, eventBus) {
   // event is returned."
   // eslint-disable-next-line max-len
   // @see [PlayReady License Acquisition]{@link https://msdn.microsoft.com/en-us/library/dn468979.aspx}
-
 
   session.addEventListener('mskeymessage', function (event) {
     addKeyToSession(options, session, event, eventBus);
